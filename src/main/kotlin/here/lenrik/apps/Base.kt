@@ -2,10 +2,12 @@ package here.lenrik.apps
 
 import io.ktor.http.*
 import io.ktor.server.application.*
+import io.ktor.server.auth.*
 import io.ktor.server.html.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.sessions.*
+import io.ktor.util.*
 import kotlinx.css.*
 import kotlinx.html.*
 import java.util.*
@@ -57,48 +59,61 @@ suspend inline fun ApplicationCall.respondCss(builder: CSSBuilder.() -> Unit) {
 	respondText(CSSBuilder().apply(builder).toString(), ContentType.Text.CSS)
 }
 
-inline fun Route.base(name: String, contentPages: Set<String> = emptySet(), crossinline body: (DIV.(ApplicationCall) -> Unit) = DIV::pageNotFound){
+inline fun Route.base(name: String, contentPages: Map<String, DIV.(ApplicationCall) -> Unit> = emptyMap()){
+	val e: Map<String, DIV.(ApplicationCall) -> Unit>
 	route("/$name"){
-		get("/{id?}") {
-			println(call.request.queryParameters)
-			call.respondHtml {
-				head {
-					title{ +"Very epic site" }
-					styleLink("/styles.css")
-				}
-				body {
-					header {
-						a("/$name/home") { img("LOGO", "/static/${name}_logo.png") }
-						for(page in contentPages){
-							a("/$name/$page") { +page }
-						}
-						println(call.sessions.get("token"))
-						when(call.sessions.get("token")){
-							"local"        -> {
-
+		authenticate("session", optional = true) { 
+			get("/{id?}") {
+				println(call.request.queryParameters.toMap())
+				call.respondHtml {
+					head {
+						title{ +"Very epic ${name.ifBlank { "site" }}" }
+						styleLink("/styles.css")
+					}
+					body {
+						header {
+							val block = {
+								img("LOGO",
+									if(javaClass.classLoader.getResource("static/${name}_logo.png") != null)	
+										"/static/${name}_logo.png"
+									else
+										"/static/home_logo.png"
+								)
 							}
-							else           -> {
-								a("/login"){
-									+ "login or register"
+							if("home" in contentPages) {
+								a("/$name/home", classes = "logo") { block() }
+							} else {
+								block()
+							}
+							for(page in contentPages.keys){
+								a("/$name/$page") { +page }
+							}
+							println("token for $name: ${call.sessions.get("token")}")
+							if(call.principal<AuthData>() == null) {
+								a("../login?redirect=/$name") {
+									+"login or register"
 								}
+							} else {
+								a("../user")
 							}
 						}
-					}
-					div(classes = "content"){
-						when (call.parameters["id"]) {
-							"login"         -> loginPage()
-							"register"      -> registrationPage()
-							in contentPages -> body(call)
-							else            -> pageNotFound(call)
+						div(classes = "content"){
+							when (call.parameters["id"]) {
+								"login"         -> loginPage(name)
+								"register"      -> registrationPage(name)
+								"user"          -> userPage(name)
+								in contentPages -> contentPages[call.parameters["id"]]!!(call)
+								else            -> pageNotFound(call)
+							}
 						}
-					}
-					footer { p {
-						val a = javaClass.classLoader.getResource("footer.txt")
-						if(a != null) {
+						footer { 
+							val a = javaClass.classLoader.getResource("footer.txt")
+							if(a != null) {
 							+a.readText().lines().first { !it.startsWith("//") }; br
 						}
-						+ "© 2023${Calendar.getInstance()[Calendar.YEAR].run { if(this > 2023) "-$this" else "" }}"
-					} }
+							+ "© 2023${Calendar.getInstance()[Calendar.YEAR].run { if(this > 2023) "-$this" else "" }}"
+						}
+					}
 				}
 			}
 		}
@@ -112,22 +127,26 @@ fun DIV.pageNotFound(call: ApplicationCall) {
 	}
 }
 
-fun DIV.loginPage() {
+fun DIV.userPage(name: String){
+	
+}
+
+fun DIV.loginPage(name: String) {
 	h1 { +"Login" }
-	postForm(classes = "form", action = "/auth/login?regirect=/my%20homies%20are%20home") {
+	postForm(classes = "form", action = "/auth/login?regirect=/$name") {
 		emailInput(name = "email") {}
 		passwordInput(name = "password") { attributes["autocomplete"] = "current-password" }
 		button(name = "login", type = ButtonType.submit) { +"login" }
 		button(name = "register", type = ButtonType.reset) {
-			onClick = "window.location.replace('/register')"
+			onClick = "window.location.replace('../register')"
 			+"register"
 		}
 	}
 }
 
-fun DIV.registrationPage() {
+fun DIV.registrationPage(name: String) {
 	h1 { +"Register" }
-	postForm(classes = "form", action = "/auth/register") {
+	postForm(classes = "form", action = "/auth/register?redirect=/$name") {
 		onChange = """
 			console.log(this)
 			this.elements.register.disabled = !(

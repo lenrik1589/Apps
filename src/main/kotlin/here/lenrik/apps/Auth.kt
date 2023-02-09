@@ -1,17 +1,21 @@
 package here.lenrik.apps
 
 import com.mongodb.MongoClientSettings
+import com.mongodb.client.MongoCollection
 import io.ktor.server.application.*
 import io.ktor.server.auth.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.sessions.*
+import io.ktor.util.*
 import org.bson.UuidRepresentation
 import org.litote.kmongo.KMongo
 import org.litote.kmongo.eq
 import org.litote.kmongo.findOne
 import org.litote.kmongo.getCollection
+import redis.clients.jedis.Jedis
+import java.io.File
 import java.security.MessageDigest
 import java.util.*
 import kotlin.random.Random
@@ -25,32 +29,54 @@ data class User(
 	var passHash: String
 )
 
+data class AuthData(val uuid: UUID, val token: String): Principal
+
 private const val pepper = "bfdkbfdvvdmwovd"
+
+suspend inline fun withUsers(crossinline body: suspend (MongoCollection<User>) -> Any?): Any? {
+	val mongo = KMongo.createClient(MongoClientSettings.builder().uuidRepresentation(UuidRepresentation.STANDARD).build())
+	val result = body(mongo.getDatabase("uni").getCollection<User>("users"))
+	mongo.close()
+	return result
+}
 
 fun Application.configureAuth() {
 	val md = MessageDigest.getInstance("SHA-256")
+	val redis = Jedis()
 	install(Sessions) {
-		this.cookie<String>("token") {
+		cookie<AuthData>("token", directorySessionStorage(File("build/.sessions"))) {
+			cookie.path = "/"
 			cookie.maxAge = Duration.INFINITE
 		}
 	}
-	
-	val createMongo = { KMongo.createClient(MongoClientSettings.builder().uuidRepresentation(UuidRepresentation.STANDARD).build()) }
 
 	authentication {
-		form("auth-form") {
+		form("form") {
 			userParamName = "email"
 			passwordParamName = "password"
 			validate { cred ->
-				val mongo = createMongo()
-				val users = mongo.getDatabase("uni").getCollection<User>("users")
-				users.findOne(User::email eq cred.name)?.run {
-					if (passHash == md.digest((salt + cred.password + pepper).toByteArray()).fold("") { str, it -> str + "%02x".format(it) }) {
-						println("login successful, here's your UUID: $_id")
-						UserIdPrincipal(_id.toString())
-					} else
-						null
-				}.also { mongo.close() }
+				withUsers { users ->
+					users.findOne(User::email eq cred.name)?.run {
+						if (Base64.getDecoder().decode(passHash).contentEquals(md.digest((salt + cred.password + pepper).toByteArray()))) {
+							println("login successful, here's your UUID: $_id")
+							UserIdPrincipal(_id.toString())
+						} else
+							null
+					}
+				} as Principal?
+			}
+		}
+		
+		session<AuthData>("session") {
+			validate { session ->
+				val token = redis.get(session.uuid.toString())
+				if(session.token == token)
+					session
+				else
+					null
+			}
+			challenge { 
+				call.respondRedirect("../login")
 			}
 		}
 	}
@@ -59,29 +85,32 @@ fun Application.configureAuth() {
 		route("/auth") {
 			post("/register") {
 				val params = call.receiveParameters()
+				println(call.request.queryParameters.toMap())
+				val password = params["password"]
+				val password_repeat = params["password_repeat"]
+				val email = params["email"]
 				when {
-					params["password"] != params["password_repeat"] -> call.respondRedirect("/")
-					else                                            -> {
-						val mongo = createMongo()
-						val users = mongo.getDatabase("uni").getCollection<User>("users")
-						val user = users.findOne(User::email eq params["email"])
+					password != password_repeat -> call.respondRedirect("/")
+					else                        ->  withUsers { users ->
+						val user = users.findOne(User::email eq email)
 						if (user != null) {
-							user.run {
-								call.respondRedirect("/")
-							}
+							call.respondRedirect("/")
 						} else {
 							val salt = Random.Default.nextBytes(32).toString(Charsets.UTF_8)
-							users.insertOne(User(UUID.randomUUID(), params["email"], params["email"]!!, salt, md.digest((salt + params["password"] + pepper).toByteArray()).fold("") { str, it -> str + "%02x".format(it) }))
+							val new = User(UUID.randomUUID(), email, email!!, salt, Base64.getEncoder().encodeToString(md.digest((salt + password + pepper).toByteArray())))
+							users.insertOne(new)
+							val token = Base64.getEncoder().encodeToString(Random.Default.nextBytes(32))
+							redis.set(new._id.toString(), token)
+							call.sessions.set(AuthData(new._id, token))
 						}
-						mongo.close()
 					}
 				}
-				call.sessions.set("token", "wawacat")
-				call.respondRedirect("/todo/home")
+				call.respondRedirect(call.request.queryParameters.toMap()["redirect"]?.get(0)?:"/")
 			}
 		}
-		authenticate("auth-form") {
+		authenticate("form") {
 			post("/auth/login") {
+				println(call.request.queryParameters.toMap())
 				call.principal<UserIdPrincipal>()?.name
 				call.respondRedirect(call.request.queryParameters["redirect"]?:"/")
 			}
