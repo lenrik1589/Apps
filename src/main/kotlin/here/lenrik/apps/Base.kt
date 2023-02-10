@@ -1,5 +1,6 @@
 package here.lenrik.apps
 
+import here.lenrik.Theme
 import here.lenrik.User
 import here.lenrik.findUser
 import io.ktor.http.*
@@ -16,7 +17,7 @@ fun Application.configureBase() {
 	routing {
 		authenticate("session", optional = true) {
 			get("/styles.css") {
-				val dark = call.user?.dark ?: false
+				val dark = call.user?.theme == Theme.dark
 				call.respondCss {
 					body {
 						display = Display.flex
@@ -78,61 +79,64 @@ suspend inline fun ApplicationCall.respondCss(builder: CSSBuilder.() -> Unit) {
 	respondText(CSSBuilder().apply(builder).toString(), ContentType.Text.CSS)
 }
 
-fun Route.base(name: String, contentPages: Map<String, DIV.(ApplicationCall) -> Unit> = emptyMap()){
+fun Route.base(name: String, contentPages: Map<String, DIV.(ApplicationCall) -> Unit> = emptyMap(), requireAuth: Set<String> = emptySet()){
 	route("/$name"){
 		authenticate("session", optional = true) { 
 			get("/{id?}") {
-				call.respondHtml {
-					head {
-						title{ +"Very epic ${name.ifBlank { "site" }}" }
-						styleLink("/styles.css")
-					}
-					body {
-						header {
-							val block = {
-								img("LOGO",
-									if(javaClass.classLoader.getResource("static/${name}_logo.png") != null)	
-										"/static/${name}_logo.png"
-									else
-										"/static/home_logo.png"
-								)
-							}
-							if("home" in contentPages) {
-								a("/$name/home", classes = "logo") { block() }
-							} else {
-								block()
-							}
-							for(page in contentPages.keys){
-								a("/$name/$page") { +page }
-							}
-							val authData = call.principal<AuthData>()
-							call.application.log.info("token for {}: {}", name, authData)
-							if(authData == null) {
-								a("login?redirect=/$name") {
-									+"login or register"
-								}
-							} else {
-								val user = findUser(authData.uuid)
-								a("user") {
-									+"user (${user?.name})"
-								}
-							}
+				if(call.parameters["id"] in requireAuth + "user" && call.principal<AuthData>() == null){
+					call.respondRedirect("/$name/login")
+				} else {
+					call.respondHtml {
+						head {
+							title{ +"Very epic ${name.ifBlank { "site" }}" }
+							styleLink("/styles.css")
 						}
-						div(classes = "content"){
-							when (call.parameters["id"]) {	
-								"login"         -> loginPage(name)
-								"register"      -> registrationPage(name)
-								"user"          -> userPage(call)
-								in contentPages -> contentPages[call.parameters["id"]]!!(call)
-								else            -> pageNotFound(name)
+						body {
+							header {
+								val block = {
+									img("LOGO",
+										if(javaClass.classLoader.getResource("static/${name}_logo.png") != null)	
+											"/static/${name}_logo.png"
+										else
+											"/static/home_logo.png"
+									)
+								}
+								if("home" in contentPages) {
+									a("/$name/home", classes = "logo") { block() }
+								} else {
+									block()
+								}
+								for(page in contentPages.keys){
+									a("/$name/$page") { +page }
+								}
+								val authData = call.principal<AuthData>()
+								if(authData == null) {
+									a("login?redirect=/$name") {
+										+"login or register"
+									}
+								} else {
+									val user = findUser(authData.uuid)
+									a("user") {
+										+"user (${user?.email})"
+									}
+								}
 							}
-						}
-						footer { 
-							val a = javaClass.classLoader.getResource("footer.txt")
-							if(a != null) {
-								+a.readText().lines().first { !it.startsWith("//") }; br
+							div(classes = "content") {
+								when (call.parameters["id"]) {	
+									"login"         -> loginPage(name)
+									"register"      -> registrationPage(name)
+									"user"          -> userPage(name, call)
+									in contentPages -> contentPages[call.parameters["id"]]!!(call)
+									else            -> pageNotFound(name)
+								}
 							}
-							+ "© 2023${Calendar.getInstance()[Calendar.YEAR].run { if(this > 2023) "-$this" else "" }}"
+							footer { 
+								val a = javaClass.classLoader.getResource("footer.txt")
+								if(a != null) {
+									+a.readText().lines().first { !it.startsWith("//") }; br
+								}
+								+ "© 2023${Calendar.getInstance()[Calendar.YEAR].run { if(this > 2023) "-$this" else "" }}"
+							}
 						}
 					}
 				}
@@ -147,8 +151,11 @@ fun DIV.pageNotFound(name: String) {
 	+"."
 }
 
-fun DIV.userPage(call: ApplicationCall){
-	call.principal<AuthData>()
+fun DIV.userPage(name: String, call: ApplicationCall){
+	val authData = call.principal<AuthData>()
+	assert(authData != null)
+	val user = findUser(authData!!.uuid)!!
+	+(user.name ?:user.email)
 }
 
 fun DIV.loginPage(name: String) {

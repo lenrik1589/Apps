@@ -1,8 +1,6 @@
 package here.lenrik.apps
 
-import here.lenrik.User
-import here.lenrik.findUser
-import here.lenrik.insertUser
+import here.lenrik.*
 import io.ktor.server.application.*
 import io.ktor.server.auth.*
 import io.ktor.server.request.*
@@ -41,25 +39,26 @@ fun Application.configureAuth() {
 			userParamName = "email"
 			passwordParamName = "password"
 			validate { cred ->
-				findUser(User::email eq cred.name)?.run {
+				findUser(User::email eq cred.name)?.run { findAuth(_id) }?.run {
 					if (Base64.getDecoder().decode(passHash).contentEquals(md.digest((salt + cred.password + pepper).toByteArray()))) {
 						println("login successful, here's your UUID: $_id")
 						UserIdPrincipal(_id.toString())
-					} else
-						null
+					} else null
 				}
+			}
+			challenge{
+				call.respondRedirect((call.request.queryParameters.toMap()["redirect"]?.get(0)?:"/") + "register")
 			}
 		}
 		
 		session<AuthData>("session") {
 			validate { session ->
 				val token = redis.get(session.uuid.toString())
-				if(session.token == token)
-					session
-				else
-					null
+				if(session.token == token) session
+				else null
 			}
-			challenge { 
+			challenge {
+				call.sessions.clear<AuthData>()
 				call.respondRedirect("../login")
 			}
 		}
@@ -76,11 +75,13 @@ fun Application.configureAuth() {
 					password == passwordRepeat && findUser(User::email eq email) == null -> {
 						call.application.log.info("registering new user with email$email")
 						val salt = Random.Default.nextBytes(32).toString(Charsets.UTF_8)
-						val new = User(UUID.randomUUID(), email, email!!, salt, Base64.getEncoder().encodeToString(md.digest((salt + password + pepper).toByteArray())), false)
-						insertUser(new)
+						val newUser = User(UUID.randomUUID(), email!!, email, Theme.light)
+						val newAuth = Auth(newUser._id, salt, Base64.getEncoder().encodeToString(md.digest((salt + password + pepper).toByteArray())))
+						insertUser(newUser)
+						insertAuth(newAuth)
 						val token = Base64.getEncoder().encodeToString(Random.Default.nextBytes(32))
-						redis.set(new._id.toString(), token)
-						call.sessions.set(AuthData(new._id, token))
+						redis.set(newAuth._id.toString(), token)
+						call.sessions.set(AuthData(newAuth._id, token))
 						call.respondRedirect(call.request.queryParameters.toMap()["redirect"]?.get(0)?:"/")
 					}
 					else                                                                 -> call.respondRedirect("/")
