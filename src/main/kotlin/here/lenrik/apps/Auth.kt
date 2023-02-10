@@ -1,7 +1,8 @@
 package here.lenrik.apps
 
-import com.mongodb.MongoClientSettings
-import com.mongodb.client.MongoCollection
+import here.lenrik.User
+import here.lenrik.findUser
+import here.lenrik.insertUser
 import io.ktor.server.application.*
 import io.ktor.server.auth.*
 import io.ktor.server.request.*
@@ -9,11 +10,8 @@ import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.sessions.*
 import io.ktor.util.*
-import org.bson.UuidRepresentation
-import org.litote.kmongo.KMongo
+import io.ktor.util.pipeline.*
 import org.litote.kmongo.eq
-import org.litote.kmongo.findOne
-import org.litote.kmongo.getCollection
 import redis.clients.jedis.Jedis
 import java.io.File
 import java.security.MessageDigest
@@ -21,24 +19,12 @@ import java.util.*
 import kotlin.random.Random
 import kotlin.time.Duration
 
-data class User(
-	val _id: UUID,
-	var name: String?,
-	val email: String,
-	val salt: String,
-	var passHash: String
-)
+typealias CallPipeline = PipelineContext<Unit, ApplicationCall>
 
 data class AuthData(val uuid: UUID, val token: String): Principal
 
+@Suppress("SpellCheckingInspection")
 private const val pepper = "bfdkbfdvvdmwovd"
-
-suspend inline fun withUsers(crossinline body: suspend (MongoCollection<User>) -> Any?): Any? {
-	val mongo = KMongo.createClient(MongoClientSettings.builder().uuidRepresentation(UuidRepresentation.STANDARD).build())
-	val result = body(mongo.getDatabase("uni").getCollection<User>("users"))
-	mongo.close()
-	return result
-}
 
 fun Application.configureAuth() {
 	val md = MessageDigest.getInstance("SHA-256")
@@ -55,15 +41,13 @@ fun Application.configureAuth() {
 			userParamName = "email"
 			passwordParamName = "password"
 			validate { cred ->
-				withUsers { users ->
-					users.findOne(User::email eq cred.name)?.run {
-						if (Base64.getDecoder().decode(passHash).contentEquals(md.digest((salt + cred.password + pepper).toByteArray()))) {
-							println("login successful, here's your UUID: $_id")
-							UserIdPrincipal(_id.toString())
-						} else
-							null
-					}
-				} as Principal?
+				findUser(User::email eq cred.name)?.run {
+					if (Base64.getDecoder().decode(passHash).contentEquals(md.digest((salt + cred.password + pepper).toByteArray()))) {
+						println("login successful, here's your UUID: $_id")
+						UserIdPrincipal(_id.toString())
+					} else
+						null
+				}
 			}
 		}
 		
@@ -85,34 +69,45 @@ fun Application.configureAuth() {
 		route("/auth") {
 			post("/register") {
 				val params = call.receiveParameters()
-				println(call.request.queryParameters.toMap())
 				val password = params["password"]
-				val password_repeat = params["password_repeat"]
+				val passwordRepeat = params["password_repeat"]
 				val email = params["email"]
 				when {
-					password != password_repeat -> call.respondRedirect("/")
-					else                        ->  withUsers { users ->
-						val user = users.findOne(User::email eq email)
-						if (user != null) {
-							call.respondRedirect("/")
-						} else {
-							val salt = Random.Default.nextBytes(32).toString(Charsets.UTF_8)
-							val new = User(UUID.randomUUID(), email, email!!, salt, Base64.getEncoder().encodeToString(md.digest((salt + password + pepper).toByteArray())))
-							users.insertOne(new)
-							val token = Base64.getEncoder().encodeToString(Random.Default.nextBytes(32))
-							redis.set(new._id.toString(), token)
-							call.sessions.set(AuthData(new._id, token))
+					password == passwordRepeat && findUser(User::email eq email) == null -> {
+						call.application.log.info("registering new user with email$email")
+						val salt = Random.Default.nextBytes(32).toString(Charsets.UTF_8)
+						val new = User(UUID.randomUUID(), email, email!!, salt, Base64.getEncoder().encodeToString(md.digest((salt + password + pepper).toByteArray())), false)
+						insertUser(new)
+						val token = Base64.getEncoder().encodeToString(Random.Default.nextBytes(32))
+						redis.set(new._id.toString(), token)
+						call.sessions.set(AuthData(new._id, token))
+						call.respondRedirect(call.request.queryParameters.toMap()["redirect"]?.get(0)?:"/")
+					}
+					else                                                                 -> call.respondRedirect("/")
+				}
+			}
+			route("/logout"){
+				suspend fun CallPipeline.action(ignored: Unit) {
+					call.principal<UserIdPrincipal>().apply { 
+						if(this != null) {
+							call.sessions.clear<AuthData>()
+							redis.del(call.principal<UserIdPrincipal>()?.name)
 						}
+						call.respondRedirect(call.request.queryParameters.toMap()["redirect"]?.get(0) ?: "/")
 					}
 				}
-				call.respondRedirect(call.request.queryParameters.toMap()["redirect"]?.get(0)?:"/")
+				get(CallPipeline::action)
+				post(CallPipeline::action)
 			}
 		}
 		authenticate("form") {
 			post("/auth/login") {
-				println(call.request.queryParameters.toMap())
-				call.principal<UserIdPrincipal>()?.name
-				call.respondRedirect(call.request.queryParameters["redirect"]?:"/")
+				val name = call.principal<UserIdPrincipal>()?.name
+				val token = Base64.getEncoder().encodeToString(Random.Default.nextBytes(32))
+				call.sessions.set(AuthData(UUID.fromString(name), token))
+				redis.set(name, token)
+				call.application.log.info("Created token {} for {}", token, name)
+				call.respondRedirect(call.request.queryParameters["redirect"] ?: "/")
 			}
 		}
 	}
